@@ -12,11 +12,17 @@
   4. 下载中回收：慢速下载未结束时源分区保持 draining 不被清空，
      下载读完原字节结束后分区自动清空回 idle；
   5. 搬移失败注入：原目录与原录像照常可用，清理周转区后重试成功。
+  6. 封区 vs 在途上传竞态（上传闸门确定性复现）：
+     a) 选中旧写入区、登记前封区 + 回收：上传报错、文件被清理、不入列表、不占容量；
+     b) 旧区封区后又被重新启用：早先选中的上传仍然报错（代次轮换）；
+     c) 只封区不回收：被拒上传写出的文件从旧区磁盘删除；
+     d) 封区/回收无需等待上传结束，新上传照常写入新写入区。
 """
 import hashlib
 import json
 import os
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -91,6 +97,45 @@ def upload(name: str, content: bytes, retained: bool = False) -> dict:
     status, _, data = req("POST", "/api/recordings", body, headers)
     assert status == 201, f"upload failed {status}: {data}"
     return data
+
+
+def upload_raw(name: str, content: bytes, retained: bool = False,
+               timeout: float = 120) -> tuple:
+    """上传但允许失败，返回 (status, body dict)，用于竞态场景断言 409。
+
+    req() 在响应可解析时已返回 dict，不可解析时返回 {"error": 原文}。
+    """
+    body, headers = multipart(name, content, retained)
+    status, _, data = req("POST", "/api/recordings", body, headers,
+                          timeout=timeout)
+    return status, data if isinstance(data, dict) else {"error": str(data)}
+
+
+def upload_gate(action: str) -> dict:
+    status, _, data = req("POST", "/api/test/upload-gate", {"action": action})
+    assert status == 200, f"upload-gate {action} failed {status}: {data}"
+    return data
+
+
+def wait_upload_gate(timeout: float = 20) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        _, _, st = req("GET", "/api/test/upload-gate")
+        if st.get("reached", 0) >= 1:
+            return
+        time.sleep(0.05)
+    raise AssertionError("上传闸门未被触发：上传没有停在登记前")
+
+
+def partition_data_files(mount_path: str) -> set:
+    """分区磁盘上所有数据文件（recordings/staging/moved）。"""
+    found = set()
+    for sub in ("recordings", "staging", "moved"):
+        root = os.path.join(mount_path, sub)
+        for walk_root, _dirs, files in os.walk(root):
+            for name in files:
+                found.add(os.path.join(walk_root, name))
+    return found
 
 
 def overview() -> dict:
@@ -348,12 +393,212 @@ def test_move_failure():
           p2_after["state"] == "idle" and p2_after["used"] == 0, str(p2_after))
 
 
+def _arm_gate_and_start(filename: str, content: bytes, result: dict):
+    """让上传停在“写完文件、尚未登记”处，返回线程。"""
+    upload_gate("arm")
+    def run():
+        result["status"], result["body"] = upload_raw(filename, content)
+    t = threading.Thread(target=run)
+    t.start()
+    wait_upload_gate()
+    return t
+
+
+def _ensure_idle_spare():
+    """确保至少有一个 idle 分区可供封区轮转。"""
+    ov = overview()
+    if any(p["state"] == "idle" for p in ov["partitions"]):
+        return
+    active = next(p for p in ov["partitions"] if p["state"] == "active")
+    status, _, data = req("POST", "/api/partitions/seal")
+    if status == 200:
+        req("POST", f"/api/partitions/{data['sealed']}/recycle")
+        try:
+            wait_state(data["sealed"], "idle", timeout=25)
+        except AssertionError:
+            pass
+
+
+def test_upload_seal_race():
+    print("\n=== 场景4: 封区 vs 在途上传竞态（上传已选旧写入区、登记前封区）===")
+    _ensure_idle_spare()
+    ov = overview()
+    old_active = next(p for p in ov["partitions"] if p["state"] == "active")
+    old_pid = old_active["id"]
+    before_ids = {r["id"] for r in ov["recordings"]}
+    old_used = part(ov, old_pid)["used"]
+
+    result = {}
+    t = _arm_gate_and_start("race-victim.bin", b"R" * 300_000, result)
+    paused = partition_data_files(old_active["mount_path"])
+    check("上传已暂停在登记前且文件已落盘（尚未登记）",
+          len(paused) >= 1, str(paused))
+
+    # 封区 + 立即回收：两者都必须不用等上传结束
+    status, _, sealed = req("POST", "/api/partitions/seal")
+    check("封区无需等待上传结束即可完成",
+          status == 200 and sealed["sealed"] == old_pid, str(sealed))
+    status, _, recycled = req("POST", f"/api/partitions/{old_pid}/recycle")
+    check("旧区回收同样无需等待上传结束",
+          status == 200 and recycled["status"] == "draining", str(recycled))
+    wait_state(old_pid, "idle", timeout=25)
+
+    # 暂停期间新上传照常写入新写入区
+    new_active_id = sealed["new_active"]
+    new_used_before = part(overview(), new_active_id)["used"]
+    new_rec = upload("race-new.bin", b"NEW-AFTER-SEAL")
+    check("封区后新上传照常写入新写入区",
+          new_rec["current_partition"] == new_active_id,
+          new_rec["current_partition"])
+
+    upload_gate("release")
+    t.join(timeout=60)
+    check("被轮换的在途上传返回 409",
+          result.get("status") == 409, f"{result.get('status')} {result.get('body')}")
+    check("错误信息说明写入区已失效",
+          "失效" in json.dumps(result.get("body"), ensure_ascii=False),
+          str(result.get("body")))
+
+    ov = overview()
+    check("作废录像未出现在录像列表",
+          {r["id"] for r in ov["recordings"]} - before_ids
+          == {new_rec["id"]}, str([r["id"] for r in ov["recordings"]]))
+    new_used_after = part(ov, new_active_id)["used"]
+    # 新写入区在此前场景已有录像，这里只比较“本场景新增”的部分
+    check("作废录像不占容量（旧区已清空、新写入区只多了这次正常上传）",
+          part(ov, old_pid)["used"] == 0
+          and new_used_after - new_rec["size"] == new_used_before,
+          f"old={part(ov, old_pid)['used']} new={new_used_after} "
+          f"before_new={new_used_before}")
+
+
+def test_upload_reuse_race():
+    print("\n=== 场景5: 旧写入区封区后又被重新启用，早先选中的上传仍须报错 ===")
+    _ensure_idle_spare()
+    ov = overview()
+    cur = next(p for p in ov["partitions"] if p["state"] == "active")["id"]
+
+    result = {}
+    t = _arm_gate_and_start("race-reuse.bin", b"U" * 120_000, result)
+
+    # 封掉它；回收清空回 idle；再封一次把它重新提升为 active
+    status, _, sealed = req("POST", "/api/partitions/seal")
+    assert status == 200, sealed
+    status, _, recycled = req("POST", f"/api/partitions/{cur}/recycle")
+    if status == 200:
+        wait_state(cur, "idle", timeout=25)
+    _ensure_idle_spare()
+    status, _, sealed2 = req("POST", "/api/partitions/seal")
+    check("同一分区编号被重新提升为写入区",
+          status == 200 and sealed2["new_active"] == cur, str(sealed2))
+    ov = overview()
+    check("重新启用后代次已增加",
+          part(ov, cur)["generation"] >= 1, str(part(ov, cur)))
+
+    upload_gate("release")
+    t.join(timeout=60)
+    check("分区重新启用后，早先选中的上传仍返回 409",
+          result.get("status") == 409, f"{result.get('status')} {result.get('body')}")
+    check("错误信息说明写入区已轮换/失效",
+          "轮换" in json.dumps(result.get("body"), ensure_ascii=False),
+          str(result.get("body")))
+    ov = overview()
+    check("作废录像未出现在列表且不占重新启用分区的容量",
+          all(r["filename"] != "race-reuse.bin" for r in ov["recordings"])
+          and part(ov, cur)["used"] == 0, f"used={part(ov, cur)['used']}")
+    fresh = upload("race-fresh.bin", b"FRESH-ON-REUSED")
+    check("重新启用后的写入区可正常接受新上传",
+          fresh["current_partition"] == cur, fresh["current_partition"])
+
+
+def test_upload_seal_only_cleanup():
+    print("\n=== 场景6: 只封区不回收，被拒上传的文件必须从旧区磁盘删除 ===")
+    _ensure_idle_spare()
+    ov = overview()
+    old_pid = next(p for p in ov["partitions"] if p["state"] == "active")["id"]
+    old_mount = part(ov, old_pid)["mount_path"]
+    old_used_before = part(ov, old_pid)["used"]
+    old_count_before = part(ov, old_pid)["recording_count"]
+    before = partition_data_files(old_mount)
+
+    result = {}
+    t = _arm_gate_and_start("race-cleanup.bin", b"C" * 250_000, result)
+    during = partition_data_files(old_mount)
+    added = during - before
+    check("暂停时旧区磁盘上有本次上传写出的文件", len(added) == 1, str(added))
+
+    status, _, sealed = req("POST", "/api/partitions/seal")
+    check("封区成功且旧区停在 sealed（暂不回收）",
+          status == 200 and sealed["sealed"] == old_pid, str(sealed))
+
+    upload_gate("release")
+    t.join(timeout=60)
+    check("上传被拒(409)", result.get("status") == 409,
+          f"{result.get('status')} {result.get('body')}")
+    after = partition_data_files(old_mount)
+    check("被拒后本次上传写出的文件已从旧区磁盘删除",
+          not (after & added), f"残留={after & added}")
+    ov = overview()
+    check("旧区(sealed)上没有该录像的元数据，也未新增容量占用",
+          part(ov, old_pid)["used"] == old_used_before
+          and part(ov, old_pid)["recording_count"] == old_count_before,
+          str(part(ov, old_pid)))
+
+    # 收尾：把 sealed 的旧区回收掉，别影响后续
+    req("POST", f"/api/partitions/{old_pid}/recycle")
+    try:
+        wait_state(old_pid, "idle", timeout=25)
+    except AssertionError:
+        pass
+
+
+def test_concurrent_uploads_during_seal():
+    print("\n=== 场景7: 封区期间并发普通上传（新上传照常写当前写入区）===")
+    _ensure_idle_spare()
+    results = []
+
+    def up(i):
+        status, data = upload_raw(f"race-multi-{i}.bin", b"M" * 8192 + bytes([i]))
+        results.append((status, data.get("current_partition"), data.get("error")))
+
+    threads = [threading.Thread(target=up, args=(i,)) for i in range(8)]
+    for th in threads:
+        th.start()
+    time.sleep(0.05)
+    status, _, sealed = req("POST", "/api/partitions/seal")
+    check("并发上传期间封区成功", status == 200, str(sealed))
+    for th in threads:
+        th.join(timeout=60)
+
+    check("并发上传全部成功或明确说明写入区失效",
+          len(results) == 8
+          and all(s == 201 or (s == 409 and "失效" in (err or ""))
+                  for s, _pid, err in results),
+          str(results))
+    check("成功的上传只落在封区的旧写入区或新写入区",
+          all(pid in (sealed["sealed"], sealed["new_active"])
+              for _s, pid, _e in results if pid),
+          str(results))
+    # 被拒上传不能留下元数据：列表里 race-multi-* 的条目数 == 成功数
+    ov = overview()
+    listed = [r for r in ov["recordings"]
+              if r["filename"].startswith("race-multi-")]
+    succeeded = [1 for s, _p, _e in results if s == 201]
+    check("被拒上传没有在录像列表留下任何条目",
+          len(listed) == len(succeeded),
+          f"列表={len(listed)} 成功={len(succeeded)}")
+
+
 def main():
     print(f"BASE_URL={BASE}")
     reset_world()
     test_basic_flow()
     test_recycle_during_download()
     test_move_failure()
+    test_upload_seal_race()
+    test_upload_reuse_race()
+    test_upload_seal_only_cleanup()
+    test_concurrent_uploads_during_seal()
     print("\n================ 汇总 ================")
     for tag, name, detail in RESULTS:
         print(f"{tag:4} {name}" + (f"  ({detail})" if detail and tag == "FAIL" else ""))

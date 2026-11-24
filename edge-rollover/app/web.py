@@ -188,6 +188,29 @@ def create_app() -> Flask:
             storage.reset_failure()
             return jsonify(storage.failure_config())
 
+        @app.get("/api/test/upload-gate")
+        def api_upload_gate_status():
+            return jsonify(service.UPLOAD_GATE.status())
+
+        @app.post("/api/test/upload-gate")
+        def api_upload_gate():
+            """确定性复现“封区 vs 在途上传”竞态。
+
+            arm：让下一个上传在“文件已写完、尚未登记”处暂停；
+            release：放行暂停的上传并停止拦截；
+            reset：解除并放行（清理测试状态）。
+            """
+            action = (request.get_json(silent=True) or {}).get("action", "status")
+            if action == "arm":
+                result = service.UPLOAD_GATE.arm()
+            elif action == "release":
+                result = service.UPLOAD_GATE.release()
+            elif action == "reset":
+                result = service.UPLOAD_GATE.reset()
+            else:
+                return jsonify({"error": f"未知 action: {action}"}), 400
+            return jsonify(result)
+
     @app.errorhandler(413)
     def too_large(_):
         return jsonify({"error": "上传体积超过服务端限制"}), 413

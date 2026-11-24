@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS partitions (
     mount_path      TEXT NOT NULL,
     image_path      TEXT,
     last_error      TEXT,
+    -- 写入区代次：每次提升为 active 时 +1。上传开始时记录 (pid, generation)，
+    -- 登记元数据前复核；代次变化说明该分区已被封区/回收/重新启用过。
+    generation      INTEGER NOT NULL DEFAULT 0,
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL
 );
@@ -79,6 +82,13 @@ def init_db(db_path: str) -> None:
     _conn.execute("PRAGMA foreign_keys=ON")
     with _LOCK:
         _conn.executescript(SCHEMA)
+        # 旧库迁移：generation 列后加，CREATE TABLE IF NOT EXISTS 不会补列。
+        # 旧数据统一从 0 开始，之后每次提升为 active 递增。
+        cols = {row[1] for row in _conn.execute("PRAGMA table_info(partitions)")}
+        if "generation" not in cols:
+            _conn.execute(
+                "ALTER TABLE partitions ADD COLUMN generation INTEGER NOT NULL DEFAULT 0"
+            )
         # 进程重启后，残留的 active 下载连接已随进程死亡，标记为 interrupted
         _conn.execute(
             "UPDATE downloads SET status='interrupted', ended_at=? "
@@ -157,12 +167,25 @@ def find_partition(state: str) -> Optional[sqlite3.Row]:
         ).fetchone()
 
 
-def set_partition_state(pid: str, state: str, error: Optional[str] = None) -> None:
+def set_partition_state(pid: str, state: str, error: Optional[str] = None,
+                        bump_generation: bool = False) -> None:
+    """切换分区状态。
+
+    bump_generation=True 用于“提升为写入区”：同一次调用内把 generation +1，
+    与状态变更原子生效。在途上传据此判断自己选中的写入区是否已被轮换。
+    """
     with _LOCK:
-        db().execute(
-            "UPDATE partitions SET state=?, last_error=?, updated_at=? WHERE id=?",
-            (state, error, time.time(), pid),
-        )
+        if bump_generation:
+            db().execute(
+                "UPDATE partitions SET state=?, last_error=?, "
+                "generation=generation+1, updated_at=? WHERE id=?",
+                (state, error, time.time(), pid),
+            )
+        else:
+            db().execute(
+                "UPDATE partitions SET state=?, last_error=?, updated_at=? WHERE id=?",
+                (state, error, time.time(), pid),
+            )
         db().commit()
 
 

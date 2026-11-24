@@ -25,6 +25,60 @@ _RECYCLE_LOCK = threading.Lock()
 _WIPE_LOCK = threading.Lock()
 
 
+class _UploadGate:
+    """测试钩子：让上传在“已写完文件、尚未登记元数据”处暂停。
+
+    仅 ENABLE_TEST_HOOKS=1 时由路由启用。用于确定性复现封区与在途上传的竞态：
+    上传在选中旧写入区并用完 IO 之后停住，测试可在此期间封区/回收/重新启用，
+    再放行上传，验证它被拒绝且不留文件、不占容量。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._event = threading.Event()
+        self.enabled = False
+        self.reached = 0
+
+    def arm(self) -> dict:
+        with self._lock:
+            self.enabled = True
+            self.reached = 0
+            self._event.clear()
+        return self.status()
+
+    def release(self) -> dict:
+        with self._lock:
+            self.enabled = False
+        self._event.set()
+        return self.status()
+
+    def reset(self) -> dict:
+        with self._lock:
+            self.enabled = False
+            self.reached = 0
+        self._event.set()
+        return self.status()
+
+    def status(self) -> dict:
+        with self._lock:
+            return {"armed": self.enabled, "reached": self.reached,
+                    "waiting": self.reached > 0 and self._event.is_set() is False}
+
+    def arrive_and_wait(self, timeout: float = 30.0) -> None:
+        with self._lock:
+            if not self.enabled:
+                return
+            # 只拦截第一个到达的上传；后续上传（比如封区后写入新写入区的
+            # 正常上传）不会被挡住，从而可以验证两者能并发推进。
+            self.enabled = False
+            self.reached += 1
+        # 超时兜底：测试忘了放行也不会永久挂住上传线程
+        self._event.wait(timeout)
+
+
+UPLOAD_GATE = _UploadGate()
+
+
 class ServiceError(Exception):
     """业务错误，message 可直接展示给网页。"""
 
@@ -69,6 +123,7 @@ def partition_view(p) -> dict:
         "mount_path": p["mount_path"],
         "image_path": p["image_path"],
         "last_error": p["last_error"],
+        "generation": p["generation"],
         "active_downloads": active_dl,
         "recording_count": len(db.recordings_on_partition(p["id"])),
     }
@@ -91,10 +146,54 @@ def overview() -> dict:
 
 # ---------------- 上传 ----------------
 
+def _discard_upload(mount: str, relpath: str, rid: str) -> None:
+    """删除本次上传写出的文件（登记前被拒绝时调用）。
+
+    正常路径下文件已在目标分区落盘；若因文件系统异常删不掉，记一条错误事件，
+    便于后续排查“孤儿文件占容量”，但不会把已作废的上传登记进列表。
+    """
+    path = storage.abs_path(mount, relpath)
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        db.log_event("error", "upload",
+                     f"作废录像 {rid} 的文件清理失败（{path}）: {exc}")
+
+
+def _write_target_valid(pid: str, generation: int) -> tuple:
+    """复核上传选中的写入区是否仍可用。返回 (ok, 说明)。"""
+    part = db.get_partition(pid)
+    if part is None:
+        return False, f"分区 {pid} 已不存在"
+    if part["state"] != "active":
+        return False, f"分区 {pid} 已封区回收"
+    if part["generation"] != generation:
+        return False, f"分区 {pid} 已被轮换（封区后重新启用）"
+    return True, ""
+
+
+def _write_target_error(pid: str, generation: int) -> str:
+    _ok, reason = _write_target_valid(pid, generation)
+    return f"{reason}，本次上传所属的写入区已失效，请重新上传到当前写入区"
+
+
 def add_recording(filename: str, stream, declared_size: Optional[int] = None,
                   declared_sha256: Optional[str] = None,
                   retained: bool = False) -> dict:
-    """把一段短录像追加到当前 active 分区；容量不足直接拒绝，不落半截文件。"""
+    """把一段短录像追加到当前 active 分区；容量不足直接拒绝，不落半截文件。
+
+    与“封区/回收”的竞态处理：
+    - 上传只在开始时选中一次写入区并记下它的 generation（代次）；
+    - 落盘期间不持有任何锁，封区/回收无需等待上传结束，新上传照常写入新写入区；
+    - 登记元数据前在同一把元数据锁内复核：该分区仍是 active 且 generation 未变。
+      任一不符即视为“选中的旧写入区在登记前已被封区”，本次上传报错并删除已写
+      出的文件，录像不入列表、不占容量。
+    - 用 generation 而不是单看状态：分区可能被封区、回收、清空后重新启用为
+      active，此时状态又变回 active，只有代次能识别“这是轮换后的新写入区”，
+      让先前选中同一分区编号的上传仍然失败。
+    """
     with db.lock():
         active = db.find_partition("active")
         if active is None:
@@ -102,6 +201,7 @@ def add_recording(filename: str, stream, declared_size: Optional[int] = None,
         pid = active["id"]
         mount = active["mount_path"]
         capacity = active["capacity"]
+        generation = active["generation"]
         used = db.partition_used_bytes(pid)
 
     if declared_size is not None and used + declared_size > capacity:
@@ -116,16 +216,37 @@ def add_recording(filename: str, stream, declared_size: Optional[int] = None,
             mount, rid, stream, declared_size, declared_sha256
         )
     except Exception as exc:  # 落盘失败：临时文件已在 storage 内清理
+        # 一种常见原因：落盘途中旧区被回收清空（目录被删/重建成空目录），
+        # 导致写入或回读校验失败。此时报告真实原因，避免误导为用户数据问题。
+        with db.lock():
+            still_ok, reason = _write_target_valid(pid, generation)
+        if not still_ok:
+            db.log_event("warn", "upload",
+                         f"录像 {filename} 落盘期间{reason}，已丢弃（{exc}）")
+            raise ServiceError(_write_target_error(pid, generation)) from exc
         raise ServiceError(f"写入分区 {pid} 失败: {exc}") from exc
 
-    # 记账复核（防止超额）
+    # 测试钩子（ENABLE_TEST_HOOKS=1 且测试显式 arm 时才暂停）：在“文件已写完、
+    # 尚未登记”处制造确定性的竞态窗口。生产环境该钩子始终关闭。
+    if Config.ENABLE_TEST_HOOKS:
+        UPLOAD_GATE.arrive_and_wait()
+
+    # 登记前复核 + 记账，全程在同一把锁内完成，与封区的状态翻转互斥。
     with db.lock():
+        still_ok, reason = _write_target_valid(pid, generation)
+        if not still_ok:
+            # 选中的写入区在上传过程中已被封区/轮换：本录像作废。
+            # 删除刚写出的文件，避免它出现在列表里或占用分区容量。
+            _discard_upload(mount, relpath, rid)
+            db.log_event(
+                "warn", "upload",
+                f"录像 {filename} 上传期间{reason}，已丢弃并清理文件 {rid}"
+            )
+            raise ServiceError(_write_target_error(pid, generation))
+
         used_after = db.partition_used_bytes(pid) + size
         if used_after > capacity:
-            try:
-                os.remove(storage.abs_path(mount, relpath))
-            except OSError:
-                pass
+            _discard_upload(mount, relpath, rid)
             raise ServiceError(f"分区 {pid} 容量超限，已拒绝该录像")
         db.insert_recording({
             "id": rid,
@@ -196,7 +317,9 @@ def seal_active() -> dict:
                 )
             old_id, new_id = active["id"], spare["id"]
             db.set_partition_state(old_id, "sealed")
-            db.set_partition_state(new_id, "active")
+            # 提升为新写入区时递增代次：让“已选中该分区、尚未登记”的在途上传
+            # 即使分区之后又被重新启用，也能识别出自己所属的写入区已轮换。
+            db.set_partition_state(new_id, "active", bump_generation=True)
         db.log_event("info", "seal",
                      f"分区 {old_id} 已封区（停止新写入），"
                      f"周转分区 {new_id} 提升为新的写入区，新录像可继续追加")
