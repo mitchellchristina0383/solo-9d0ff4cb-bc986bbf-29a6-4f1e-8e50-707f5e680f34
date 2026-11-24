@@ -1,0 +1,28 @@
+services:
+  edge-rollover:
+    build: .
+    image: edge-rollover:latest
+    container_name: edge-rollover
+    # loop 镜像挂载需要特权；若改用目录模式（USE_LOOP_IMAGES=0）可去掉 privileged
+    privileged: true
+    ports:
+      - "8080:8080"
+    environment:
+      DATA_DIR: /data
+      # 与 loop 镜像大小保持一致
+      PARTITION_CAPACITY: "67108864"          # 64 MiB
+      PARTITION_COUNT: "3"
+      ENABLE_TEST_HOOKS: "1"                  # 验收测试用；生产置 0
+      DRAIN_POLL_INTERVAL: "2"
+      USE_LOOP_IMAGES: "1"                    # 无特权环境置 0 即降级为目录
+    volumes:
+      - rollover-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/api/overview')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  rollover-data:

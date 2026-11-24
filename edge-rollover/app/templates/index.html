@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>边缘录像卷回收台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>边缘录像卷回收台</h1>
+  <div class="hint">三份等容量本地分区镜像 · 一份周转 · 封区回收 · 在途下载排空</div>
+  <button id="refresh-btn" class="ghost">刷新</button>
+</header>
+
+<main>
+<section>
+  <h2>分区状态</h2>
+  <div id="partitions" class="cards"></div>
+</section>
+
+<section>
+  <h2>追加短录像</h2>
+  <form id="upload-form" class="row">
+    <input type="file" name="file" required>
+    <label class="check"><input type="checkbox" name="retained" value="1"> 同时标记留存</label>
+    <button type="submit">上传到写入区</button>
+    <span id="upload-msg" class="msg"></span>
+  </form>
+</section>
+
+<section>
+  <h2>分区操作</h2>
+  <div class="row wrap">
+    <button id="seal-btn">封区（停止写入并提升周转分区）</button>
+    <span class="msg" id="op-msg"></span>
+  </div>
+</section>
+
+<section>
+  <h2>录像清单</h2>
+  <table>
+    <thead><tr>
+      <th>ID / 文件名</th><th>大小</th><th>留存</th><th>源分区 → 现分区</th>
+      <th>状态</th><th>操作</th>
+    </tr></thead>
+    <tbody id="recs"></tbody>
+  </table>
+</section>
+
+<section>
+  <h2>在途 / 最近下载</h2>
+  <div id="downloads" class="mono small"></div>
+</section>
+
+<section id="test-hooks" class="hidden">
+  <h2>测试钩子（ENABLE_TEST_HOOKS=1）</h2>
+  <div class="row wrap">
+    <label>搬移写入失败阈值（字节）
+      <input type="number" id="fail-after" value="2097152" min="1" style="width:12em">
+    </label>
+    <button id="fail-btn">注入搬移失败</button>
+    <button id="reset-fail-btn" class="ghost">解除故障注入</button>
+    <span class="msg" id="fail-msg"></span>
+  </div>
+  <div class="hint">下载链接可加 <code>?slow=0.5</code> 制造慢速下载，用于“下载中回收”测试。</div>
+</section>
+
+<section>
+  <h2>事件日志</h2>
+  <div id="events" class="mono small log"></div>
+</section>
+</main>
+
+<script>
+const STATE_LABEL = {
+  active: '写入区', sealed: '已封区', recycling: '回收中',
+  draining: '排空中', idle: '周转空闲'
+};
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => (
+    {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function fmtSize(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n/1024).toFixed(1) + ' KiB';
+  return (n/1048576).toFixed(2) + ' MiB';
+}
+function fmtTime(ts) {
+  return new Date(ts * 1000).toLocaleTimeString('zh-CN', {hour12:false});
+}
+async function api(url, opts={}) {
+  const r = await fetch(url, {headers:{'Accept':'application/json'}, ...opts});
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+  return data;
+}
+function flash(el, text, ok=true) {
+  el.textContent = text;
+  el.className = 'msg ' + (ok ? 'ok' : 'err');
+  setTimeout(() => { el.textContent = ''; }, 6000);
+}
+
+async function render() {
+  const ov = await api('/api/overview');
+
+  document.getElementById('partitions').innerHTML = ov.partitions.map(p => {
+    const pct = p.capacity ? Math.round(100 * p.used / p.capacity) : 0;
+    const actions = [];
+    if (p.state === 'sealed')
+      actions.push(`<button onclick="recycle('${p.id}')">发起回收</button>`);
+    if (p.state === 'recycling') {
+      actions.push(`<button onclick="retryRecycle('${p.id}')">重试回收</button>`);
+      actions.push(`<button class="ghost" onclick="cleanup('${p.id}')">清理周转区</button>`);
+    }
+    if (p.state === 'draining')
+      actions.push(`<button class="ghost" onclick="drain('${p.id}')">立即检查排空</button>`);
+    return `<div class="card state-${p.state}">
+      <div class="card-head"><b>${p.id}</b><span class="badge">${STATE_LABEL[p.state]||p.state}</span></div>
+      <div class="bar"><div style="width:${pct}%"></div></div>
+      <div class="small">已用 ${fmtSize(p.used)} / ${fmtSize(p.capacity)}（${pct}%）</div>
+      <div class="small">录像 ${p.recording_count} 个 · 在途下载 ${p.active_downloads} 个</div>
+      ${p.last_error ? `<div class="err small">错误：${esc(p.last_error)}</div>` : ''}
+      <div class="row wrap actions">${actions.join('')}</div>
+    </div>`;
+  }).join('');
+
+  document.getElementById('recs').innerHTML = ov.recordings.map(r => `
+    <tr>
+      <td><code>${esc(r.id)}</code><br><span class="small">${esc(r.filename)}</span></td>
+      <td>${fmtSize(r.size)}</td>
+      <td>${r.retained ? '✔ 留存' : '—'}</td>
+      <td>${esc(r.source_partition)} → <b>${esc(r.current_partition)}</b></td>
+      <td>${r.state === 'moved' ? '已搬移（链接已切换）' : '正常'}</td>
+      <td class="row wrap">
+        <a href="/api/recordings/${esc(r.id)}/download"><button>下载</button></a>
+        <button class="ghost" onclick="toggleRetain('${esc(r.id)}', ${r.retained ? 0 : 1})">
+          ${r.retained ? '取消留存' : '标记留存'}</button>
+      </td>
+    </tr>`).join('') || '<tr><td colspan="6" class="small">暂无录像</td></tr>';
+
+  const dl = ov.active_downloads.map(d =>
+    `<div>● ${esc(d.token)} rec=${esc(d.recording_id)} 分区=${esc(d.partition_id)} 起于 ${fmtTime(d.started_at)}</div>`);
+  document.getElementById('downloads').innerHTML =
+    dl.join('') || '<div class="hint">当前无活动下载</div>';
+
+  document.getElementById('events').innerHTML = ov.events.map(e =>
+    `<div class="ev-${esc(e.level)}">[${fmtTime(e.ts)}] <b>${esc(e.category)}</b> ${esc(e.message)}</div>`
+  ).join('');
+
+  if (ov.failure) {
+    document.getElementById('test-hooks').classList.remove('hidden');
+  }
+}
+
+window.recycle = async (pid) => {
+  try {
+    const r = await api(`/api/partitions/${pid}/recycle`, {method:'POST'});
+    flash(document.getElementById('op-msg'),
+      r.status === 'failed'
+        ? `回收失败：${r.failed.map(f=>f.error).join('; ')}（原数据可用，清理周转区后可重试）`
+        : `回收完成：${r.moved.length} 个片段已搬入 ${r.target}，源分区${r.drain.action === 'cleared' ? '已排空' : '等待下载结束'}`,
+      r.status !== 'failed');
+  } catch (e) { flash(document.getElementById('op-msg'), e.message, false); }
+  render();
+};
+window.retryRecycle = (pid) => window.recycle(pid);
+window.cleanup = async (pid) => {
+  try {
+    const r = await api(`/api/partitions/${pid}/cleanup`, {method:'POST'});
+    flash(document.getElementById('op-msg'),
+      `已清理 ${r.removed_parts} 个临时文件，回滚 ${r.rolled_back.length} 个归属，可重试回收`);
+  } catch (e) { flash(document.getElementById('op-msg'), e.message, false); }
+  render();
+};
+window.drain = async (pid) => {
+  try {
+    const r = await api(`/api/partitions/${pid}/drain`, {method:'POST'});
+    flash(document.getElementById('op-msg'),
+      r.action === 'cleared' ? `${pid} 已清空并回到周转池` : `${pid} 仍有 ${r.active_downloads||0} 个在途下载`);
+  } catch (e) { flash(document.getElementById('op-msg'), e.message, false); }
+  render();
+};
+window.toggleRetain = async (rid, retained) => {
+  try { await api(`/api/recordings/${rid}/retained`, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({retained: !!retained})});
+  } catch (e) { alert(e.message); }
+  render();
+};
+
+document.getElementById('seal-btn').onclick = async () => {
+  try {
+    const r = await api('/api/partitions/seal', {method:'POST'});
+    flash(document.getElementById('op-msg'),
+      `已封区 ${r.sealed}，新写入区 ${r.new_active}`);
+  } catch (e) { flash(document.getElementById('op-msg'), e.message, false); }
+  render();
+};
+document.getElementById('refresh-btn').onclick = render;
+document.getElementById('upload-form').onsubmit = async (ev) => {
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  const msg = document.getElementById('upload-msg');
+  try {
+    const r = await fetch('/api/recordings', {method:'POST', body: fd});
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || '上传失败');
+    flash(msg, `上传成功：${data.id}（${fmtSize(data.size)}）`);
+    ev.target.reset();
+  } catch (e) { flash(msg, e.message, false); }
+  render();
+};
+document.getElementById('fail-btn')?.addEventListener('click', async () => {
+  const after = Number(document.getElementById('fail-after').value);
+  try {
+    await api('/api/test/fail-move', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({after_bytes: after})});
+    flash(document.getElementById('fail-msg'), `已注入：搬移写入 ${after} 字节后失败`);
+  } catch (e) { flash(document.getElementById('fail-msg'), e.message, false); }
+});
+document.getElementById('reset-fail-btn')?.addEventListener('click', async () => {
+  try {
+    await api('/api/test/reset-fail', {method:'POST'});
+    flash(document.getElementById('fail-msg'), '故障注入已解除');
+  } catch (e) { flash(document.getElementById('fail-msg'), e.message, false); }
+});
+
+render();
+setInterval(render, 3000);
+</script>
+</body>
+</html>
